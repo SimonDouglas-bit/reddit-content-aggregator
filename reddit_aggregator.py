@@ -306,6 +306,142 @@ class RedditContentAggregator:
                     f.write("---\n\n")
             
             print(f"Exported post to {filepath}")
+    
+    def export_to_csv(self, posts, output_file="reddit_posts.csv"):
+        """Export posts to CSV file"""
+        # Create DataFrame from posts
+        df_posts = pd.DataFrame([
+            {k: v for k, v in post.items() if k != 'top_comments'}
+            for post in posts
+        ])
+        
+        # Convert UTC timestamps to readable dates
+        if 'created_utc' in df_posts.columns:
+            df_posts['created_date'] = df_posts['created_utc'].apply(
+                lambda x: datetime.fromtimestamp(x).strftime('%Y-%m-%d %H:%M:%S')
+            )
+        
+        # Export to CSV
+        df_posts.to_csv(output_file, index=False)
+        print(f"Exported {len(df_posts)} posts to {output_file}")
+        
+        # Create and export comments to separate CSV
+        comments_data = []
+        for post in posts:
+            for comment in post['top_comments']:
+                comment_data = comment.copy()
+                comment_data['post_id'] = post['id']
+                comment_data['post_title'] = post['title']
+                
+                # Convert sentiment dict to separate columns
+                if 'sentiment' in comment_data:
+                    for k, v in comment_data['sentiment'].items():
+                        comment_data[f'sentiment_{k}'] = v
+                    del comment_data['sentiment']
+                    
+                comments_data.append(comment_data)
+                
+        if comments_data:
+            df_comments = pd.DataFrame(comments_data)
+            
+            # Convert UTC timestamps to readable dates
+            if 'created_utc' in df_comments.columns:
+                df_comments['created_date'] = df_comments['created_utc'].apply(
+                    lambda x: datetime.fromtimestamp(x).strftime('%Y-%m-%d %H:%M:%S')
+                )
+                
+            comments_file = output_file.replace('.csv', '_comments.csv')
+            df_comments.to_csv(comments_file, index=False)
+            print(f"Exported {len(df_comments)} comments to {comments_file}")
+    
+    def export_to_json(self, posts, output_file="reddit_posts.json"):
+        """Export posts to JSON file"""
+        # Convert datetime objects to strings for JSON serialization
+        def json_serial(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError(f"Type {type(obj)} not serializable")
+        
+        # Export to JSON
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(posts, f, default=json_serial, indent=2)
+            
+        print(f"Exported {len(posts)} posts to {output_file}")
+    
+    def generate_summary(self, posts, output_file=None):
+        """Generate a summary of the collected posts"""
+        if not posts:
+            print("No posts to summarize.")
+            return
+            
+        # Count posts by subreddit
+        subreddit_counts = Counter([p['subreddit'] for p in posts])
+        
+        # Get average scores
+        avg_score = sum(p['score'] for p in posts) / len(posts)
+        
+        # Get time range
+        post_times = [p['created_utc'] for p in posts]
+        oldest = datetime.fromtimestamp(min(post_times))
+        newest = datetime.fromtimestamp(max(post_times))
+        
+        # Extract trending topics
+        trending = self.extract_trending_topics(posts, num_topics=10)
+        
+        # Format summary
+        summary = [
+            "# Reddit Content Summary",
+            "",
+            f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"**Total Posts Collected:** {len(posts)}",
+            f"**Date Range:** {oldest.strftime('%Y-%m-%d')} to {newest.strftime('%Y-%m-%d')}",
+            f"**Average Score:** {avg_score:.1f}",
+            "",
+            "## Posts by Subreddit",
+            ""
+        ]
+        
+        for subreddit, count in subreddit_counts.most_common():
+            summary.append(f"- r/{subreddit}: {count} posts")
+            
+        summary.extend([
+            "",
+            "## Trending Topics",
+            ""
+        ])
+        
+        for word, count in trending:
+            summary.append(f"- {word}: {count} occurrences")
+            
+        summary.extend([
+            "",
+            "## Top Posts",
+            ""
+        ])
+        
+        # Add top 5 posts by score
+        top_posts = sorted(posts, key=lambda x: x['score'], reverse=True)[:5]
+        for i, post in enumerate(top_posts, 1):
+            summary.append(f"### {i}. {post['title']}")
+            summary.append(f"**Score:** {post['score']} | r/{post['subreddit']} | u/{post['author']}")
+            summary.append(f"**Link:** {post['url']}")
+            summary.append("")
+            
+        # Output summary
+        summary_text = "\n".join(summary)
+        
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(summary_text)
+            print(f"Summary saved to {output_file}")
+        
+        return summary_text
+    
+    def close(self):
+        """Close database connection"""
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
 
 def main():
     parser = argparse.ArgumentParser(description='Reddit Content Aggregator')
@@ -314,4 +450,88 @@ def main():
     parser.add_argument('--limit', type=int, default=25,
                         help='Maximum number of posts per subreddit')
     parser.add_argument('--time', type=str, default='week',
-                        choices=['hour', 'day', 'week',
+                        choices=['hour', 'day', 'week', 'month', 'year', 'all'],
+                        help='Time filter for posts')
+    parser.add_argument('--min-upvotes', type=int, default=10,
+                        help='Minimum upvotes for posts')
+    parser.add_argument('--keywords', type=str, default=None,
+                        help='Comma-separated keywords to filter by')
+    parser.add_argument('--output-format', type=str, default='markdown',
+                        choices=['markdown', 'csv', 'json', 'all'],
+                        help='Output format')
+    parser.add_argument('--output-dir', type=str, default='./content',
+                        help='Output directory for content')
+    parser.add_argument('--config', type=str, default='reddit_config.json',
+                        help='Path to Reddit API configuration file')
+    parser.add_argument('--summary', action='store_true',
+                        help='Generate summary report')
+    
+    args = parser.parse_args()
+    
+    # Initialize aggregator
+    try:
+        aggregator = RedditContentAggregator(config_path=args.config)
+    except FileNotFoundError:
+        print(f"Error: Config file '{args.config}' not found.")
+        print("Please create a config file with your Reddit API credentials.")
+        print("Example: cp reddit_config.example.json reddit_config.json")
+        return
+    
+    # Process subreddits and keywords arguments
+    subreddits = [s.strip() for s in args.subreddits.split(',')]
+    keywords = None
+    if args.keywords:
+        keywords = [k.strip() for k in args.keywords.split(',')]
+    
+    # Create output directory if it doesn't exist
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    
+    try:
+        # Scan subreddits
+        results = aggregator.scan_multiple_subreddits(
+            subreddits,
+            limit=args.limit,
+            time_filter=args.time,
+            min_upvotes=args.min_upvotes,
+            keywords=keywords
+        )
+        
+        # Flatten results
+        all_posts = [post for subreddit_posts in results.values() 
+                    for post in subreddit_posts]
+        
+        if not all_posts:
+            print("No posts found matching your criteria.")
+            return
+            
+        print(f"Found {len(all_posts)} posts matching criteria.")
+        
+        # Export results based on format
+        if args.output_format in ['markdown', 'all']:
+            markdown_dir = os.path.join(args.output_dir, 'markdown')
+            aggregator.export_to_markdown(all_posts, output_dir=markdown_dir)
+            
+        if args.output_format in ['csv', 'all']:
+            csv_file = os.path.join(args.output_dir, 'reddit_posts.csv')
+            aggregator.export_to_csv(all_posts, output_file=csv_file)
+            
+        if args.output_format in ['json', 'all']:
+            json_file = os.path.join(args.output_dir, 'reddit_posts.json')
+            aggregator.export_to_json(all_posts, output_file=json_file)
+            
+        # Generate summary if requested
+        if args.summary:
+            summary_file = os.path.join(args.output_dir, 'summary.md')
+            summary = aggregator.generate_summary(all_posts, output_file=summary_file)
+            print("\nSummary:")
+            print(summary[:500] + "..." if len(summary) > 500 else summary)
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        # Close connection
+        aggregator.close()
+
+if __name__ == "__main__":
+    main()
